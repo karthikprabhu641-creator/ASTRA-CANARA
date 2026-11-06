@@ -221,6 +221,13 @@ bool verify_against_oracle(const Options& options, const AckOracle& oracle,
             return false;
         }
     }
+    for (const auto& entry : actual) {
+        if (expected.find(entry.first) == expected.end()) {
+            error = "cycle " + std::to_string(cycle) + " unexpected unacknowledged key '" +
+                entry.first + "'";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -284,14 +291,6 @@ bool expect_response(torture::ChildProcess& server, const std::string& request,
     return true;
 }
 
-bool apply_acknowledged_operation(AckOracle& oracle, const kvdb::Operation& operation,
-                                  std::string& error) {
-    if (operation.type == kvdb::Operation::Type::Put) {
-        return oracle.record_put(operation.key, operation.value, error);
-    }
-    return oracle.record_del(operation.key, error);
-}
-
 bool execute_operation(torture::ChildProcess& server, AckOracle& oracle,
                        const torture::GeneratedOperation& operation, std::uint64_t op_id,
                        const std::filesystem::path& batch_file, std::string& error) {
@@ -348,11 +347,9 @@ bool execute_operation(torture::ChildProcess& server, AckOracle& oracle,
         return false;
     }
     if (!acknowledged) return false;
-    for (const auto& item : operation.batch) {
-        if (!apply_acknowledged_operation(oracle, item, error)) {
-            error = "BATCH was acknowledged but oracle persistence failed: " + error;
-            return false;
-        }
+    if (!oracle.record_batch(operation.batch, error)) {
+        error = "BATCH was acknowledged but oracle persistence failed: " + error;
+        return false;
     }
     return true;
 }
@@ -539,17 +536,19 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             pending_acknowledged = true;
+            std::vector<kvdb::Operation> pending_operations;
+            pending_operations.reserve(pending_batch_size);
             for (std::size_t i = 0; i < pending_batch_size; ++i) {
-                const kvdb::Operation operation{kvdb::Operation::Type::Put,
+                pending_operations.push_back({kvdb::Operation::Type::Put,
                     "phase6_pending_" + std::to_string(cycle) + "_" + std::to_string(i),
-                    "pending_value_" + std::to_string(cycle) + "_" + std::to_string(i)};
-                if (!apply_acknowledged_operation(*oracle, operation, error)) {
-                    terminate_server(server, error);
-                    std::error_code ignored;
-                    std::filesystem::remove(pending_file, ignored);
-                    print_history(options.seed, cycle, history, "ACKed pending batch oracle error: " + error);
-                    return 1;
-                }
+                    "pending_value_" + std::to_string(cycle) + "_" + std::to_string(i)});
+            }
+            if (!oracle->record_batch(pending_operations, error)) {
+                terminate_server(server, error);
+                std::error_code ignored;
+                std::filesystem::remove(pending_file, ignored);
+                print_history(options.seed, cycle, history, "ACKed pending batch oracle error: " + error);
+                return 1;
             }
         } else if (!error.empty() && error != "timed out waiting for child output") {
             terminate_server(server, error);

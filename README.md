@@ -114,6 +114,10 @@ The separate `torture_tool_phase6` target starts `kvdb serve` as a child process
 
 By default the Phase 6 runner uses separate `torture_phase6.db` and `torture_phase6.ack.log` files and looks for the `kvdb` executable beside itself. Use `--reset` only when intentionally discarding those specified test files. Modes are `all` (mixed workload plus crash batches), `batch` (batch workload plus crash batches), and `crash` (only interrupted-batch crash cycles).
 
+## Phase 7 oracle correctness
+
+The ACK oracle supports atomic batch journal records and continues to replay the legacy PUT/DEL record format. The Phase 5 runner serializes each database operation with its corresponding oracle update, preserving commit order in the expected state while worker threads submit workloads. Run `oracle_tests` to validate batch replay, concurrent journal writes, malformed-record rejection, and torn-tail recovery.
+
 ## CLI interface
 
 The following command shape is the proposed judge-facing interface:

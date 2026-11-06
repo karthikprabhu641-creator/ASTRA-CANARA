@@ -55,6 +55,12 @@ add_executable(workload_generator_tests
 )
 target_link_libraries(workload_generator_tests PRIVATE kvdb_core)
 
+add_executable(oracle_tests
+    tests/torture/oracle_test.cpp
+    tests/torture/oracle.cpp
+)
+target_link_libraries(oracle_tests PRIVATE kvdb_core Threads::Threads)
+
 # Isolated Phase 6 child-process crash/recovery runner.
 add_executable(torture_tool_phase6
     tests/torture/torture_phase6_main.cpp

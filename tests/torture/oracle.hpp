@@ -1,9 +1,12 @@
 #pragma once
 
+#include "kvdb/types.hpp"
+
 #include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 class AckOracle {
 public:
@@ -11,6 +14,7 @@ public:
 
     bool record_put(const std::string& key, const std::string& value, std::string& error);
     bool record_del(const std::string& key, std::string& error);
+    bool record_batch(const std::vector<kvdb::Operation>& operations, std::string& error);
 
     std::optional<std::string> get(const std::string& key) const;
     std::unordered_map<std::string, std::string> snapshot() const;

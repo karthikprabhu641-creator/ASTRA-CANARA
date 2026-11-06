@@ -1,12 +1,14 @@
 #include "oracle.hpp"
 
 #include <cerrno>
+#include <charconv>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #if defined(_WIN32)
 #include <io.h>
@@ -61,7 +63,8 @@ bool sync_file(std::FILE* file) {
 #endif
 }
 
-bool parse_record(const std::string& line, char& operation, std::string& key, std::string& value) {
+bool parse_legacy_record(const std::string& line, char& operation, std::string& key,
+                         std::string& value) {
     const std::size_t first_tab = line.find('\t');
     if (first_tab == std::string::npos || first_tab != 1) return false;
 
@@ -87,6 +90,58 @@ bool parse_record(const std::string& line, char& operation, std::string& key, st
     }
 
     return false;
+}
+
+std::vector<std::string> split_tabs(const std::string& line) {
+    std::vector<std::string> fields;
+    std::size_t start = 0;
+    while (true) {
+        const std::size_t separator = line.find('\t', start);
+        fields.push_back(line.substr(start, separator == std::string::npos
+            ? std::string::npos : separator - start));
+        if (separator == std::string::npos) break;
+        start = separator + 1;
+    }
+    return fields;
+}
+
+bool parse_batch_record(const std::string& line, std::vector<kvdb::Operation>& operations) {
+    const auto fields = split_tabs(line);
+    if (fields.size() < 2 || fields[0] != "B") return false;
+
+    std::size_t count = 0;
+    const auto parsed = std::from_chars(fields[1].data(),
+        fields[1].data() + fields[1].size(), count);
+    if (parsed.ec != std::errc{} || parsed.ptr != fields[1].data() + fields[1].size() ||
+        count == 0 || count > kvdb::MAX_BATCH_OPERATIONS) {
+        return false;
+    }
+
+    operations.clear();
+    operations.reserve(count);
+    std::size_t field = 2;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (field >= fields.size()) return false;
+        const std::string& type = fields[field++];
+        std::string key;
+        std::string value;
+        if (type == "P") {
+            if (field + 1 >= fields.size() ||
+                !decode_hex(fields[field++], key) ||
+                !decode_hex(fields[field++], value) || key.empty()) {
+                return false;
+            }
+            operations.push_back({kvdb::Operation::Type::Put, std::move(key), std::move(value)});
+        } else if (type == "D") {
+            if (field >= fields.size() || !decode_hex(fields[field++], key) || key.empty()) {
+                return false;
+            }
+            operations.push_back({kvdb::Operation::Type::Delete, std::move(key), {}});
+        } else {
+            return false;
+        }
+    }
+    return field == fields.size();
 }
 
 } // namespace
@@ -115,16 +170,31 @@ AckOracle::AckOracle(const std::string& journal_path) : journal_path_(journal_pa
             throw std::runtime_error("invalid ACK journal framing: " + journal_path_);
         }
 
-        char operation = '\0';
-        std::string key;
-        std::string value;
-        if (!parse_record(contents.substr(record_start, record_end - record_start), operation, key, value)) {
-            throw std::runtime_error("invalid ACK journal record: " + journal_path_);
-        }
-        if (operation == 'P') {
-            expected_state_[key] = value;
+        const std::string record = contents.substr(record_start, record_end - record_start);
+        if (!record.empty() && record[0] == 'B') {
+            std::vector<kvdb::Operation> operations;
+            if (!parse_batch_record(record, operations)) {
+                throw std::runtime_error("invalid ACK journal batch record: " + journal_path_);
+            }
+            for (const auto& operation : operations) {
+                if (operation.type == kvdb::Operation::Type::Put) {
+                    expected_state_[operation.key] = operation.value;
+                } else {
+                    expected_state_.erase(operation.key);
+                }
+            }
         } else {
-            expected_state_.erase(key);
+            char operation = '\0';
+            std::string key;
+            std::string value;
+            if (!parse_legacy_record(record, operation, key, value)) {
+                throw std::runtime_error("invalid ACK journal record: " + journal_path_);
+            }
+            if (operation == 'P') {
+                expected_state_[key] = value;
+            } else {
+                expected_state_.erase(key);
+            }
         }
         record_start = record_end + 1;
     }
@@ -187,6 +257,45 @@ bool AckOracle::record_del(const std::string& key, std::string& error) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!append_record("D\t" + encode_hex(key) + "\n", error)) return false;
     expected_state_.erase(key);
+    return true;
+}
+
+bool AckOracle::record_batch(const std::vector<kvdb::Operation>& operations, std::string& error) {
+    if (operations.empty() || operations.size() > kvdb::MAX_BATCH_OPERATIONS) {
+        error = "ACK journal batch size must be between 1 and " +
+            std::to_string(kvdb::MAX_BATCH_OPERATIONS);
+        return false;
+    }
+
+    std::string record = "B\t" + std::to_string(operations.size());
+    for (const auto& operation : operations) {
+        if (operation.key.empty() || operation.key.size() > kvdb::MAX_KEY_SIZE ||
+            (operation.type == kvdb::Operation::Type::Put &&
+             operation.value.size() > kvdb::MAX_VALUE_SIZE) ||
+            (operation.type != kvdb::Operation::Type::Put &&
+             operation.type != kvdb::Operation::Type::Delete)) {
+            error = "ACK journal batch contains an invalid operation";
+            return false;
+        }
+        if (operation.type == kvdb::Operation::Type::Put) {
+            record += "\tP\t" + encode_hex(operation.key) + "\t" + encode_hex(operation.value);
+        } else {
+            record += "\tD\t" + encode_hex(operation.key);
+        }
+    }
+    record.push_back('\n');
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto updated_state = expected_state_;
+    for (const auto& operation : operations) {
+        if (operation.type == kvdb::Operation::Type::Put) {
+            updated_state[operation.key] = operation.value;
+        } else {
+            updated_state.erase(operation.key);
+        }
+    }
+    if (!append_record(record, error)) return false;
+    expected_state_.swap(updated_state);
     return true;
 }
 

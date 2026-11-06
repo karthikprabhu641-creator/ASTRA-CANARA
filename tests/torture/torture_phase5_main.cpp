@@ -8,7 +8,10 @@
 #include <exception>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -120,14 +123,6 @@ bool apply_mutation(kvdb::Database& db, AckOracle& oracle, const kvdb::Operation
     return oracle.record_del(operation.key, error);
 }
 
-bool record_acknowledged_mutation(AckOracle& oracle, const kvdb::Operation& operation,
-                                  std::string& error) {
-    if (operation.type == kvdb::Operation::Type::Put) {
-        return oracle.record_put(operation.key, operation.value, error);
-    }
-    return oracle.record_del(operation.key, error);
-}
-
 bool verify_get(kvdb::Database& db, const AckOracle& oracle, const std::string& key,
                 std::string& error) {
     const auto actual = db.get(key);
@@ -164,9 +159,44 @@ bool execute_generated(kvdb::Database& db, AckOracle& oracle,
         error = std::string("BATCH failed: ") + kvdb::status_to_string(status);
         return false;
     }
-    for (const auto& operation : generated.batch) {
-        if (!record_acknowledged_mutation(oracle, operation, error)) {
-            error = "BATCH acknowledged but oracle update failed: " + error;
+    if (!oracle.record_batch(generated.batch, error)) {
+        error = "BATCH acknowledged but oracle update failed: " + error;
+        return false;
+    }
+    return true;
+}
+
+bool verify_final_state(kvdb::Database& db, const AckOracle& oracle, std::string& error) {
+    std::ostringstream dump;
+    const kvdb::Status status = db.dump(dump);
+    if (!kvdb::is_ok(status)) {
+        error = std::string("database dump failed: ") + kvdb::status_to_string(status);
+        return false;
+    }
+
+    std::map<std::string, std::string> actual;
+    std::istringstream lines(dump.str());
+    std::string line;
+    while (std::getline(lines, line)) {
+        const std::size_t separator = line.find('=');
+        if (separator == std::string::npos || separator == 0 ||
+            !actual.emplace(line.substr(0, separator), line.substr(separator + 1)).second) {
+            error = "malformed or duplicate database dump row: " + line;
+            return false;
+        }
+    }
+
+    const auto expected = oracle.snapshot();
+    for (const auto& entry : expected) {
+        const auto found = actual.find(entry.first);
+        if (found == actual.end() || found->second != entry.second) {
+            error = "final state mismatch for key '" + entry.first + "'";
+            return false;
+        }
+    }
+    for (const auto& entry : actual) {
+        if (expected.find(entry.first) == expected.end()) {
+            error = "database contains unacknowledged key '" + entry.first + "'";
             return false;
         }
     }
@@ -209,6 +239,7 @@ int main(int argc, char* argv[]) {
               << " threads=" << options.threads << "\n";
 
     std::atomic<bool> failed{false};
+    std::mutex operation_mutex;
     std::vector<std::string> errors(options.threads);
     std::vector<std::thread> workers;
     workers.reserve(options.threads);
@@ -224,6 +255,8 @@ int main(int argc, char* argv[]) {
                      operation_index < operation_count && !failed.load(); ++operation_index) {
                     const auto operation = generator.next();
                     std::string error;
+                    std::lock_guard<std::mutex> operation_lock(operation_mutex);
+                    if (failed.load()) break;
                     if (!execute_generated(db, *oracle, operation, error)) {
                         errors[worker_id] = "worker " + std::to_string(worker_id) +
                             " operation " + std::to_string(operation_index) + ": " + error;
@@ -249,13 +282,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    for (const auto& entry : oracle->snapshot()) {
-        const auto actual = db.get(entry.first);
-        if (!kvdb::is_ok(actual.status) || actual.value != entry.second) {
-            std::cerr << "[Torture] Final state mismatch for key '" << entry.first << "'\n";
-            db.close();
-            return 1;
-        }
+    std::string verification_error;
+    if (!verify_final_state(db, *oracle, verification_error)) {
+        std::cerr << "[Torture] " << verification_error << "\n";
+        db.close();
+        return 1;
     }
 
     const kvdb::Status close_status = db.close();
