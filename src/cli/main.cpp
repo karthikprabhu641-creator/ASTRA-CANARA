@@ -5,6 +5,9 @@
 #include <vector>
 #include <sstream>
 #include <stdexcept>
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+#include "crash_hook.hpp"
+#endif
 
 namespace {
 
@@ -248,8 +251,15 @@ int main(int argc, char* argv[]) {
                         std::string unescaped_val = kvdb::cli::BatchParser::unescape(val);
                         s = db.put(key, unescaped_val);
                         if (kvdb::is_ok(s)) {
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+                            torture::crash_if_selected("before_ack");
+#endif
                             // Durability guarantee: ACK only after durable sync
                             std::cout << "ACK " << op_id << "\n";
+                            std::cout.flush();
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+                            torture::crash_if_selected("after_ack");
+#endif
                         } else {
                             std::cout << "ERR " << op_id << " " << kvdb::status_to_string(s) << "\n";
                         }
@@ -261,7 +271,14 @@ int main(int argc, char* argv[]) {
                     } else {
                         s = db.remove(key);
                         if (kvdb::is_ok(s)) {
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+                            torture::crash_if_selected("before_ack");
+#endif
                             std::cout << "ACK " << op_id << "\n";
+                            std::cout.flush();
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+                            torture::crash_if_selected("after_ack");
+#endif
                         } else {
                             std::cout << "ERR " << op_id << " " << kvdb::status_to_string(s) << "\n";
                         }
@@ -292,7 +309,14 @@ int main(int argc, char* argv[]) {
                         } else {
                             s = db.batch(ops);
                             if (kvdb::is_ok(s)) {
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+                                torture::crash_if_selected("before_ack");
+#endif
                                 std::cout << "ACK " << op_id << "\n";
+                                std::cout.flush();
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+                                torture::crash_if_selected("after_ack");
+#endif
                             } else {
                                 std::cout << "ERR " << op_id << " " << kvdb::status_to_string(s) << "\n";
                             }

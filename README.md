@@ -118,6 +118,17 @@ By default the Phase 6 runner uses separate `torture_phase6.db` and `torture_pha
 
 The ACK oracle supports atomic batch journal records and continues to replay the legacy PUT/DEL record format. The Phase 5 runner serializes each database operation with its corresponding oracle update, preserving commit order in the expected state while worker threads submit workloads. Run `oracle_tests` to validate batch replay, concurrent journal writes, malformed-record rejection, and torn-tail recovery.
 
+## Phase 8 deterministic crash points
+
+The test-only `kvdb_crash_test` executable enables explicit crash hooks without enabling them in the normal `kvdb` binary. `torture_tool_phase8` deterministically rotates through crashes after BEGIN, after operation frames, after COMMIT, after durable sync, before ACK, and after ACK. It verifies integrity and recovered state for every point. The expected contract is no mutation before COMMIT, all-or-none recovery after COMMIT, and durable presence once sync completes; after-ACK scenarios must match the persistent oracle.
+
+```bash
+./build/torture_tool_phase8 --seed 1337 --iterations 500
+./build/torture_tool_phase8 --seed 42 --iterations 12 --db ./tmp/phase8.db --oracle ./tmp/phase8.ack.log
+```
+
+By default, the runner uses the `kvdb` and `kvdb_crash_test` executables beside itself and generates unique per-scenario DB/journal files that it removes after successful verification.
+
 ## CLI interface
 
 The following command shape is the proposed judge-facing interface:

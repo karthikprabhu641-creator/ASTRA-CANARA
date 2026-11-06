@@ -61,6 +61,35 @@ add_executable(oracle_tests
 )
 target_link_libraries(oracle_tests PRIVATE kvdb_core Threads::Threads)
 
+# Test-only CLI with deterministic transaction/ACK crash hooks.
+add_executable(kvdb_crash_test
+    src/cli/main.cpp
+    src/database.cpp
+    src/storage/format.cpp
+    src/storage/file.cpp
+    src/storage/index.cpp
+    src/recovery/recovery.cpp
+    src/concurrency/compactor.cpp
+    src/cli/batch_parser.cpp
+)
+target_include_directories(kvdb_crash_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/torture
+)
+target_compile_definitions(kvdb_crash_test PRIVATE KVDB_ENABLE_CRASH_HOOKS)
+
+# Phase 8 deterministic crash-point verification executable.
+add_executable(torture_tool_phase8
+    tests/torture/torture_phase8_main.cpp
+    tests/torture/child_process.cpp
+    tests/torture/oracle.cpp
+)
+target_include_directories(torture_tool_phase8 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/torture
+)
+target_link_libraries(torture_tool_phase8 PRIVATE Threads::Threads)
+
 # Isolated Phase 6 child-process crash/recovery runner.
 add_executable(torture_tool_phase6
     tests/torture/torture_phase6_main.cpp

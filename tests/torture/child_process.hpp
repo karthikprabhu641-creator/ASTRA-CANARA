@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace torture {
@@ -15,7 +16,8 @@ public:
     ChildProcess& operator=(const ChildProcess&) = delete;
 
     bool start(const std::string& executable, const std::vector<std::string>& arguments,
-               std::string& error);
+               std::string& error,
+               const std::vector<std::pair<std::string, std::string>>& environment = {});
     bool write_line(const std::string& line, std::string& error);
     bool read_line(std::string& line, std::chrono::milliseconds timeout, bool& eof,
                    std::string& error);

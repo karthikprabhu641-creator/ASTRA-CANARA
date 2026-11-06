@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -65,6 +68,43 @@ void close_handle(HANDLE& handle) {
     }
 }
 
+struct EnvironmentKeyLess {
+    bool operator()(const std::string& left, const std::string& right) const {
+        return std::lexicographical_compare(left.begin(), left.end(), right.begin(), right.end(),
+            [](unsigned char a, unsigned char b) {
+                return std::tolower(a) < std::tolower(b);
+            });
+    }
+};
+
+std::vector<char> make_environment_block(
+    const std::vector<std::pair<std::string, std::string>>& overrides) {
+    std::map<std::string, std::string, EnvironmentKeyLess> variables;
+    LPCH current = GetEnvironmentStringsA();
+    if (current) {
+        for (LPCH entry = current; *entry != '\0'; entry += std::strlen(entry) + 1) {
+            const std::string item(entry);
+            const std::size_t separator = item[0] == '=' ? item.find('=', 1) : item.find('=');
+            if (separator != std::string::npos) {
+                variables[item.substr(0, separator)] = item.substr(separator + 1);
+            }
+        }
+        FreeEnvironmentStringsA(current);
+    }
+    for (const auto& override_value : overrides) {
+        variables[override_value.first] = override_value.second;
+    }
+
+    std::vector<char> block;
+    for (const auto& variable : variables) {
+        const std::string item = variable.first + "=" + variable.second;
+        block.insert(block.end(), item.begin(), item.end());
+        block.push_back('\0');
+    }
+    block.push_back('\0');
+    return block;
+}
+
 } // namespace
 #else
 namespace {
@@ -88,7 +128,8 @@ ChildProcess::~ChildProcess() {
 }
 
 bool ChildProcess::start(const std::string& executable, const std::vector<std::string>& arguments,
-                         std::string& error) {
+                         std::string& error,
+                         const std::vector<std::pair<std::string, std::string>>& environment) {
     if (
 #if defined(_WIN32)
         impl_->process != nullptr
@@ -136,9 +177,10 @@ bool ChildProcess::start(const std::string& executable, const std::vector<std::s
     startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
 
     PROCESS_INFORMATION process_info{};
+    std::vector<char> environment_block = make_environment_block(environment);
     const BOOL created = CreateProcessA(
         executable.c_str(), mutable_command.data(), nullptr, nullptr, TRUE,
-        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process_info);
+        CREATE_NO_WINDOW, environment_block.data(), nullptr, &startup, &process_info);
     close_handle(child_input);
     close_handle(child_output);
     if (!created) {
@@ -186,6 +228,11 @@ bool ChildProcess::start(const std::string& executable, const std::vector<std::s
             argv.push_back(const_cast<char*>(argument.c_str()));
         }
         argv.push_back(nullptr);
+        for (const auto& variable : environment) {
+            if (setenv(variable.first.c_str(), variable.second.c_str(), 1) != 0) {
+                _exit(126);
+            }
+        }
         execv(executable.c_str(), argv.data());
         _exit(127);
     }

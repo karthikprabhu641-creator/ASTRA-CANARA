@@ -9,6 +9,9 @@
 #include <atomic>
 #include <algorithm>
 #include <cstring>
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+#include "crash_hook.hpp"
+#endif
 
 namespace kvdb {
 
@@ -54,20 +57,32 @@ public:
         // Append BEGIN
         Status s = file.append(begin_bytes.data(), begin_bytes.size());
         if (!is_ok(s)) return s;
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+        torture::crash_if_selected("after_begin");
+#endif
 
         // Append Operations
         for (const auto& b : ops_bytes) {
             s = file.append(b.data(), b.size());
             if (!is_ok(s)) return s;
         }
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+        torture::crash_if_selected("after_operations");
+#endif
 
         // Append COMMIT
         s = file.append(commit_bytes.data(), commit_bytes.size());
         if (!is_ok(s)) return s;
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+        torture::crash_if_selected("after_commit");
+#endif
 
         // Durable sync before updating in-memory index or reporting success
         s = file.sync();
         if (!is_ok(s)) return s;
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+        torture::crash_if_selected("after_sync");
+#endif
 
         // Publish to in-memory index
         for (const auto& op : ops) {
@@ -318,4 +333,3 @@ bool Database::is_open() const {
 }
 
 } // namespace kvdb
-
