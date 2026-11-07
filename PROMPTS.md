@@ -88,7 +88,57 @@ before y role we will do the strucure that my every team members will work on th
 
 ---
 
-### Prompt 3
+### Prompt 3 (Storage Engine)
+- **Tool:** Antigravity IDE (Gemini 3.8 Flash)
+- **Approximate Time:** 2026-11-06 15:11 IST
+- **Prompt:**
+```text
+You are responsible for the STORAGE ENGINE of our C++17 embedded key-value database.
+
+YOUR RESPONSIBILITIES:
+
+1. Design and implement the core storage engine.
+2. Implement PUT, GET and DELETE operations.
+3. Implement binary serialization and deserialization.
+4. Maintain an in-memory index using suitable C++ data structures.
+5. Support at least 1 million keys.
+6. Handle large keys and values safely.
+7. Implement efficient file read and write operations.
+8. Provide clean interfaces for the durability and recovery modules.
+
+BEFORE CODING:
+
+- Read CONTRACT.md.
+- Understand the agreed binary file format.
+- Coordinate with Member 2 about transaction records and checksums.
+- Coordinate with Member 3 about index synchronization.
+- Do not independently change the file format.
+
+EXPECTED OUTPUT:
+
+- Storage engine header and implementation files.
+- Data structures for indexing.
+- Serialization/deserialization logic.
+- Unit tests for PUT, GET and DELETE.
+- Tests for large values and 1 million keys.
+- Documentation explaining your implementation.
+
+CODE QUALITY:
+
+- Use clean C++17.
+- Avoid unnecessary memory copies.
+- Handle invalid input and file errors.
+- Keep functions modular.
+- Add meaningful comments around critical storage logic.
+
+Work only on your assigned branch.
+
+Do not claim an operation is complete until its required durability guarantees are implemented through the agreed interface.
+```
+
+---
+
+### Prompt 4 (Team Lead & Integration)
 - **Tool:** Antigravity IDE (Gemini 3.8 Flash)
 - **Approximate Time:** 2026-11-06 15:06 IST
 - **Prompt:**
@@ -258,4 +308,5 @@ raise the PR
 ```text
 now, develop phase 3
 ```
+
 

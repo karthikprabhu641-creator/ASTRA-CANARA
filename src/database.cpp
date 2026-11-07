@@ -9,6 +9,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #if defined(KVDB_ENABLE_CRASH_HOOKS)
 #include "crash_hook.hpp"
 #endif
@@ -24,11 +25,22 @@ public:
     concurrency::LockManager lock_mgr;
     std::atomic<TxId> next_tx_id{1};
     bool is_open{false};
+    bool write_failed{false};
 
     Status append_transaction(const std::vector<Operation>& ops) {
         if (!is_open) return Status::NotOpen;
+        if (write_failed) return Status::IoError;
 
         TxId tx_id = next_tx_id.fetch_add(1);
+        const std::uint64_t transaction_start = file.size();
+        const auto rollback = [this, transaction_start](Status cause) {
+            const Status rollback_status = file.truncate(transaction_start);
+            if (!is_ok(rollback_status)) {
+                write_failed = true;
+                return rollback_status;
+            }
+            return cause;
+        };
 
         // Pre-encode frames to calculate size
         storage::Frame begin_frame{RecordType::Begin, tx_id, "", ""};
@@ -37,16 +49,42 @@ public:
         std::vector<std::vector<std::uint8_t>> ops_bytes;
         std::uint64_t total_payload_bytes = begin_bytes.size();
 
+        struct StagedOp {
+            Operation::Type type;
+            std::string key;
+            std::uint64_t val_offset;
+            std::uint64_t val_len;
+        };
+        std::vector<StagedOp> staged;
+        if (begin_bytes.size() >
+            std::numeric_limits<std::uint64_t>::max() - transaction_start) {
+            return Status::NoSpace;
+        }
+        std::uint64_t current_file_offset = transaction_start + begin_bytes.size();
+
         for (const auto& op : ops) {
             RecordType rtype = (op.type == Operation::Type::Put) ? RecordType::Put : RecordType::Delete;
             storage::Frame f{rtype, tx_id, op.key, op.value};
             auto b = storage::serialize_frame(f);
+            if (b.size() > std::numeric_limits<std::uint64_t>::max() - total_payload_bytes ||
+                b.size() > std::numeric_limits<std::uint64_t>::max() - current_file_offset) {
+                return Status::NoSpace;
+            }
             total_payload_bytes += b.size();
+
+            std::uint64_t val_offset = current_file_offset + storage::FRAME_HEADER_SIZE + op.key.size();
+            staged.push_back({op.type, op.key, val_offset, static_cast<std::uint64_t>(op.value.size())});
+            current_file_offset += b.size();
+
             ops_bytes.push_back(std::move(b));
         }
 
         storage::Frame commit_frame{RecordType::Commit, tx_id, "", ""};
         auto commit_bytes = storage::serialize_frame(commit_frame);
+        if (commit_bytes.size() >
+            std::numeric_limits<std::uint64_t>::max() - total_payload_bytes) {
+            return Status::NoSpace;
+        }
         total_payload_bytes += commit_bytes.size();
 
         // Check space capacity
@@ -54,9 +92,12 @@ public:
             return Status::NoSpace;
         }
 
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+        torture::report_test_phase("transaction_serialized");
+#endif
         // Append BEGIN
         Status s = file.append(begin_bytes.data(), begin_bytes.size());
-        if (!is_ok(s)) return s;
+        if (!is_ok(s)) return rollback(s);
 #if defined(KVDB_ENABLE_CRASH_HOOKS)
         torture::crash_if_selected("after_begin");
 #endif
@@ -64,35 +105,47 @@ public:
         // Append Operations
         for (const auto& b : ops_bytes) {
             s = file.append(b.data(), b.size());
-            if (!is_ok(s)) return s;
+            if (!is_ok(s)) return rollback(s);
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+            torture::report_test_phase("transaction_operation_written");
+#endif
         }
 #if defined(KVDB_ENABLE_CRASH_HOOKS)
         torture::crash_if_selected("after_operations");
 #endif
 
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+        torture::report_test_phase("transaction_before_commit");
+#endif
         // Append COMMIT
         s = file.append(commit_bytes.data(), commit_bytes.size());
-        if (!is_ok(s)) return s;
+        if (!is_ok(s)) return rollback(s);
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+        torture::report_test_phase("transaction_commit_written");
+#endif
 #if defined(KVDB_ENABLE_CRASH_HOOKS)
         torture::crash_if_selected("after_commit");
 #endif
 
         // Durable sync before updating in-memory index or reporting success
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+        torture::report_test_phase("transaction_before_sync");
+#endif
         s = file.sync();
-        if (!is_ok(s)) return s;
+        if (!is_ok(s)) return rollback(s);
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+        torture::report_test_phase("transaction_synced");
+#endif
 #if defined(KVDB_ENABLE_CRASH_HOOKS)
         torture::crash_if_selected("after_sync");
 #endif
 
         // Publish to in-memory index
-        for (const auto& op : ops) {
-            if (op.type == Operation::Type::Put) {
-                storage::IndexEntry entry;
-                entry.cached_value = op.value;
-                entry.value_len = op.value.size();
-                index.put(op.key, entry);
+        for (const auto& item : staged) {
+            if (item.type == Operation::Type::Put) {
+                index.put(item.key, storage::IndexEntry{item.val_offset, item.val_len, tx_id});
             } else {
-                index.remove(op.key);
+                index.remove(item.key);
             }
         }
 
@@ -127,6 +180,7 @@ Status Database::open(const std::string& path, std::uint64_t max_bytes) {
     }
 
     impl_->next_tx_id = rec_result.committed_transactions + 1;
+    impl_->write_failed = false;
     impl_->is_open = true;
     return Status::Ok;
 }
@@ -155,10 +209,26 @@ Result Database::get(const std::string& key) {
     }
 
     impl_->lock_mgr.lock_shared();
-    auto entry = impl_->index.get(key);
-    if (entry.has_value()) {
-        res.status = Status::Ok;
-        res.value = entry->cached_value;
+    auto entry_opt = impl_->index.get(key);
+    if (entry_opt.has_value()) {
+        const auto& entry = *entry_opt;
+        if (entry.val_len == 0) {
+            res.status = Status::Ok;
+            res.value.clear();
+        } else {
+            res.value.resize(static_cast<std::size_t>(entry.val_len));
+            Status s = impl_->file.read_at(
+                entry.val_file_offset,
+                reinterpret_cast<std::uint8_t*>(&res.value[0]),
+                static_cast<std::size_t>(entry.val_len)
+            );
+            if (is_ok(s)) {
+                res.status = Status::Ok;
+            } else {
+                res.status = s;
+                res.value.clear();
+            }
+        }
     } else {
         res.status = Status::NotFound;
     }
@@ -214,13 +284,24 @@ Status Database::close() {
     if (!impl_->is_open) return Status::Ok;
 
     impl_->lock_mgr.lock_exclusive();
-    impl_->file.sync();
-    impl_->file.close();
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+    torture::report_test_phase("database_close_before_sync");
+#endif
+    Status status = impl_->file.sync();
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+    torture::report_test_phase("database_close_after_sync");
+    torture::report_test_phase("database_close_before_file_close");
+#endif
+    const Status close_status = impl_->file.close();
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+    torture::report_test_phase("database_close_after_file_close");
+#endif
+    if (is_ok(status) && !is_ok(close_status)) status = close_status;
     impl_->index.clear();
     impl_->is_open = false;
     impl_->lock_mgr.unlock_exclusive();
 
-    return Status::Ok;
+    return status;
 }
 
 Status Database::dump(std::ostream& out) {
@@ -228,15 +309,31 @@ Status Database::dump(std::ostream& out) {
 
     impl_->lock_mgr.lock_shared();
     auto entries = impl_->index.get_all_entries();
-    // Deterministic lexicographical sort by key
+    // Deterministic lexicographical sort by key for deterministic dump output
     std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
         return a.first < b.first;
     });
-    for (const auto& [k, v] : entries) {
-        out << k << "=" << v.cached_value << "\n";
+
+    Status status = Status::Ok;
+    for (const auto& [k, entry] : entries) {
+        std::string val;
+        if (entry.val_len > 0) {
+            val.resize(static_cast<std::size_t>(entry.val_len));
+            status = impl_->file.read_at(
+                entry.val_file_offset,
+                reinterpret_cast<std::uint8_t*>(&val[0]),
+                static_cast<std::size_t>(entry.val_len)
+            );
+            if (!is_ok(status)) break;
+        }
+        out << k << "=" << val << "\n";
+        if (!out) {
+            status = Status::IoError;
+            break;
+        }
     }
     impl_->lock_mgr.unlock_shared();
-    return Status::Ok;
+    return status;
 }
 
 Status Database::check() {

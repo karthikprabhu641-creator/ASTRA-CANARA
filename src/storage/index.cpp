@@ -30,6 +30,16 @@ void Index::clear() {
     table_.clear();
 }
 
+void Index::reserve(std::size_t capacity) {
+    table_.reserve(capacity);
+}
+
+void Index::for_each(const std::function<void(const std::string&, const IndexEntry&)>& fn) const {
+    for (const auto& [k, v] : table_) {
+        fn(k, v);
+    }
+}
+
 std::vector<std::pair<std::string, IndexEntry>> Index::get_all_entries() const {
     std::vector<std::pair<std::string, IndexEntry>> entries;
     entries.reserve(table_.size());
@@ -40,4 +50,3 @@ std::vector<std::pair<std::string, IndexEntry>> Index::get_all_entries() const {
 }
 
 } // namespace kvdb::storage
-

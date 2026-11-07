@@ -1,5 +1,7 @@
 #include "kvdb/database.hpp"
 #include "kvdb/cli/batch_parser.hpp"
+#include <charconv>
+#include <cstdint>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -24,7 +26,7 @@ void print_usage(std::ostream& out = std::cout) {
         << "  kvdb batch <path> <batch_file>\n"
         << "  kvdb dump <path>\n"
         << "  kvdb check <path>\n"
-        << "  kvdb serve <path>\n";
+        << "  kvdb serve <path> [--max-bytes N]\n";
 }
 
 } // namespace
@@ -48,6 +50,33 @@ int main(int argc, char* argv[]) {
     }
 
     std::string db_path = argv[2];
+    std::uint64_t max_bytes = 0;
+    if (command == "serve") {
+        for (int i = 3; i < argc; ++i) {
+            std::string argument = argv[i];
+            std::string value;
+            if (argument == "--max-bytes") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: missing value for --max-bytes\n";
+                    return EXIT_CLI_ERROR;
+                }
+                value = argv[++i];
+            } else if (argument.rfind("--max-bytes=", 0) == 0) {
+                value = argument.substr(12);
+            } else {
+                std::cerr << "Error: unknown serve option: " << argument << "\n";
+                return EXIT_CLI_ERROR;
+            }
+
+            const auto parsed = std::from_chars(
+                value.data(), value.data() + value.size(), max_bytes);
+            if (value.empty() || parsed.ec != std::errc{} ||
+                parsed.ptr != value.data() + value.size()) {
+                std::cerr << "Error: invalid value for --max-bytes: " << value << "\n";
+                return EXIT_CLI_ERROR;
+            }
+        }
+    }
     kvdb::Database db;
 
     try {
@@ -83,8 +112,12 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: " << kvdb::status_to_string(s) << "\n";
                 return EXIT_CLI_ERROR;
             }
+            s = db.close();
+            if (!kvdb::is_ok(s)) {
+                std::cerr << "Error closing database: " << kvdb::status_to_string(s) << "\n";
+                return EXIT_CLI_ERROR;
+            }
             std::cout << "OK\n";
-            db.close();
             return EXIT_CLI_SUCCESS;
         }
 
@@ -101,7 +134,7 @@ int main(int argc, char* argv[]) {
         }
 
         // For all other commands, open the database first
-        kvdb::Status s = db.open(db_path);
+        kvdb::Status s = db.open(db_path, max_bytes);
         if (!kvdb::is_ok(s)) {
             std::cerr << "Failed to open database: " << kvdb::status_to_string(s) << "\n";
             return EXIT_CLI_ERROR;
@@ -126,8 +159,12 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: " << kvdb::status_to_string(s) << "\n";
                 return EXIT_CLI_ERROR;
             }
+            s = db.close();
+            if (!kvdb::is_ok(s)) {
+                std::cerr << "Error closing database: " << kvdb::status_to_string(s) << "\n";
+                return EXIT_CLI_ERROR;
+            }
             std::cout << "OK\n";
-            db.close();
             return EXIT_CLI_SUCCESS;
         }
 
@@ -144,7 +181,12 @@ int main(int argc, char* argv[]) {
             }
 
             auto res = db.get(key);
-            db.close();
+            const kvdb::Status close_status = db.close();
+            if (!kvdb::is_ok(close_status)) {
+                std::cerr << "Error closing database: "
+                          << kvdb::status_to_string(close_status) << "\n";
+                return EXIT_CLI_ERROR;
+            }
 
             if (res.status == kvdb::Status::NotFound) {
                 std::cerr << "NOT_FOUND\n";
@@ -171,10 +213,15 @@ int main(int argc, char* argv[]) {
             }
 
             s = db.remove(key);
-            db.close();
+            const kvdb::Status close_status = db.close();
 
             if (!kvdb::is_ok(s)) {
                 std::cerr << "Error: " << kvdb::status_to_string(s) << "\n";
+                return EXIT_CLI_ERROR;
+            }
+            if (!kvdb::is_ok(close_status)) {
+                std::cerr << "Error closing database: "
+                          << kvdb::status_to_string(close_status) << "\n";
                 return EXIT_CLI_ERROR;
             }
             std::cout << "OK\n";
@@ -195,10 +242,15 @@ int main(int argc, char* argv[]) {
                 return EXIT_CLI_ERROR;
             }
             s = db.batch(ops);
-            db.close();
+            const kvdb::Status close_status = db.close();
 
             if (!kvdb::is_ok(s)) {
                 std::cerr << "Batch error: " << kvdb::status_to_string(s) << "\n";
+                return EXIT_CLI_ERROR;
+            }
+            if (!kvdb::is_ok(close_status)) {
+                std::cerr << "Error closing database: "
+                          << kvdb::status_to_string(close_status) << "\n";
                 return EXIT_CLI_ERROR;
             }
             std::cout << "OK\n";
@@ -208,8 +260,14 @@ int main(int argc, char* argv[]) {
         // --- 6. DUMP command ---
         if (command == "dump") {
             s = db.dump(std::cout);
-            db.close();
-            return kvdb::is_ok(s) ? EXIT_CLI_SUCCESS : EXIT_CLI_ERROR;
+            const kvdb::Status close_status = db.close();
+            if (!kvdb::is_ok(s)) return EXIT_CLI_ERROR;
+            if (!kvdb::is_ok(close_status)) {
+                std::cerr << "Error closing database: "
+                          << kvdb::status_to_string(close_status) << "\n";
+                return EXIT_CLI_ERROR;
+            }
+            return EXIT_CLI_SUCCESS;
         }
 
         // --- 7. SERVE command ---
@@ -239,6 +297,27 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
+#if defined(KVDB_ENABLE_CRASH_HOOKS)
+                if (op == "ARM") {
+                    std::uint64_t occurrence = 1;
+                    std::string occurrence_text;
+                    if (iss >> occurrence_text) {
+                        const auto parsed = std::from_chars(
+                            occurrence_text.data(),
+                            occurrence_text.data() + occurrence_text.size(),
+                            occurrence);
+                        if (parsed.ec != std::errc{} ||
+                            parsed.ptr != occurrence_text.data() + occurrence_text.size() ||
+                            occurrence == 0) {
+                            std::cout << "ERR " << op_id << " invalid_occurrence\n";
+                            std::cout.flush();
+                            continue;
+                        }
+                    }
+                    torture::arm_test_phase_pause(op_id, occurrence);
+                    std::cout << "ARMED " << op_id << "\n";
+                } else
+#endif
                 if (op == "PUT") {
                     std::string key, val;
                     if (!(iss >> key)) {
@@ -351,7 +430,11 @@ int main(int argc, char* argv[]) {
 
                 std::cout.flush();
             }
-            db.close();
+            s = db.close();
+            if (!kvdb::is_ok(s)) {
+                std::cerr << "Error closing database: " << kvdb::status_to_string(s) << "\n";
+                return EXIT_CLI_ERROR;
+            }
             return EXIT_CLI_SUCCESS;
         }
 

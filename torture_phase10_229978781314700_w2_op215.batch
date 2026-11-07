@@ -1,0 +1,12 @@
+PUT worker_2_key_49 worker_2_value_12629831351652319934
+PUT worker_2_key_46 worker_2_value_17684577515223576721
+PUT worker_2_key_48 worker_2_value_9389253740522929149
+PUT worker_2_key_15 worker_2_value_16584261533057789337
+DEL worker_2_key_14
+PUT worker_2_key_23 worker_2_value_9999315197482388654
+PUT worker_2_key_19 worker_2_value_66921890126317017
+DEL worker_2_key_42
+DEL worker_2_key_60
+DEL worker_2_key_24
+PUT worker_2_key_8 worker_2_value_4821243138079458120
+DEL worker_2_key_14

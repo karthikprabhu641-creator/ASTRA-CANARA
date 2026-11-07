@@ -153,6 +153,10 @@ Status BatchParser::parse_line(const std::string& line, Operation& out_op, bool&
         return Status::InvalidArgument;
     }
 
+    if (pos < line.size() && line[pos] != ' ' && line[pos] != '\t') {
+        return Status::InvalidArgument;
+    }
+
     if (key.empty() || key.size() > MAX_KEY_SIZE) {
         return Status::InvalidArgument;
     }
@@ -242,6 +246,11 @@ Status BatchParser::parse_file(const std::string& filepath, std::vector<Operatio
         }
 
         out_operations.push_back(std::move(op));
+    }
+
+    if (file.bad()) {
+        out_operations.clear();
+        return Status::IoError;
     }
 
     if (out_operations.empty()) {

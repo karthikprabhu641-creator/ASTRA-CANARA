@@ -1,11 +1,12 @@
 #include "kvdb/storage/format.hpp"
 #include <cstring>
+#include <algorithm>
 
 namespace kvdb::storage {
 
 namespace {
 
-// Standard CRC32 table (IEEE 802.3)
+// Standard CRC32 lookup table (IEEE 802.3 polynomial 0xEDB88320)
 static const std::uint32_t crc32_table[256] = {
     0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419, 0x706af48f, 0xe963a535, 0x9e6495a3,
     0x0edb8832, 0x79dcb8a4, 0xe0d5e91e, 0x97d2d988, 0x09b64c2b, 0x7eb17cbd, 0xe7b82d07, 0x90bf1d91,
@@ -52,86 +53,158 @@ std::uint32_t calculate_crc32(const std::uint8_t* data, std::size_t size) {
 }
 
 std::vector<std::uint8_t> serialize_file_header() {
-    std::vector<std::uint8_t> buffer(sizeof(RawFileHeader), 0);
-    RawFileHeader* hdr = reinterpret_cast<RawFileHeader*>(buffer.data());
-    hdr->magic = FILE_MAGIC;
-    hdr->format_version = FILE_FORMAT_VERSION;
-    hdr->header_length = FILE_HEADER_LENGTH;
-    std::memset(hdr->reserved, 0, sizeof(hdr->reserved));
+    std::vector<std::uint8_t> buffer(FILE_HEADER_SIZE, 0);
+    encode_le64(buffer.data() + 0, FILE_MAGIC);
+    encode_le32(buffer.data() + 8, FILE_FORMAT_VERSION);
+    encode_le32(buffer.data() + 12, FILE_HEADER_LENGTH);
+    // bytes 16..31 are reserved and remain zeroed
     return buffer;
 }
 
 Status deserialize_file_header(const std::uint8_t* buffer, std::size_t size) {
-    if (size < sizeof(RawFileHeader)) {
+    if (size < FILE_HEADER_SIZE) {
         return Status::Corruption;
     }
-    const RawFileHeader* hdr = reinterpret_cast<const RawFileHeader*>(buffer);
-    if (hdr->magic != FILE_MAGIC || hdr->format_version != FILE_FORMAT_VERSION || hdr->header_length != FILE_HEADER_LENGTH) {
+
+    std::uint64_t magic = decode_le64(buffer + 0);
+    std::uint32_t version = decode_le32(buffer + 8);
+    std::uint32_t length = decode_le32(buffer + 12);
+
+    if (magic != FILE_MAGIC) {
         return Status::Corruption;
     }
+    if (version != FILE_FORMAT_VERSION) {
+        return Status::Corruption;
+    }
+    if (length != FILE_HEADER_LENGTH) {
+        return Status::Corruption;
+    }
+
+    // Verify reserved bytes are all zero
+    for (std::size_t i = 16; i < FILE_HEADER_SIZE; ++i) {
+        if (buffer[i] != 0) {
+            return Status::Corruption;
+        }
+    }
+
     return Status::Ok;
 }
 
+void serialize_frame_to(const Frame& frame, std::vector<std::uint8_t>& out_buffer) {
+    std::size_t key_len = frame.key.size();
+    std::size_t val_len = frame.value.size();
+    std::size_t total_size = calculate_frame_size(key_len, val_len);
+
+    std::size_t start_idx = out_buffer.size();
+    out_buffer.resize(start_idx + total_size);
+    std::uint8_t* p = out_buffer.data() + start_idx;
+
+    // Fixed 28-byte frame header
+    encode_le32(p + 0, FRAME_MAGIC);
+    encode_le16(p + 4, FRAME_FORMAT_VERSION);
+    p[6] = static_cast<std::uint8_t>(frame.type);
+    p[7] = 0; // Flags = 0
+    encode_le64(p + 8, frame.tx_id);
+    encode_le32(p + 16, static_cast<std::uint32_t>(key_len));
+    encode_le64(p + 20, static_cast<std::uint64_t>(val_len));
+
+    // Payload
+    std::uint8_t* payload = p + FRAME_HEADER_SIZE;
+    if (key_len > 0) {
+        std::memcpy(payload, frame.key.data(), key_len);
+    }
+    if (val_len > 0) {
+        std::memcpy(payload + key_len, frame.value.data(), val_len);
+    }
+
+    // CRC32 calculation over header + payload
+    std::size_t data_len_for_crc = FRAME_HEADER_SIZE + key_len + val_len;
+    std::uint32_t checksum = calculate_crc32(p, data_len_for_crc);
+
+    // Append 4-byte CRC32 at the end
+    encode_le32(p + data_len_for_crc, checksum);
+}
+
 std::vector<std::uint8_t> serialize_frame(const Frame& frame) {
-    std::size_t total_size = sizeof(RawFrameHeader) + frame.key.size() + frame.value.size() + sizeof(std::uint32_t);
-    std::vector<std::uint8_t> buffer(total_size);
-
-    RawFrameHeader* hdr = reinterpret_cast<RawFrameHeader*>(buffer.data());
-    hdr->frame_magic = FRAME_MAGIC;
-    hdr->format_version = FRAME_FORMAT_VERSION;
-    hdr->record_type = static_cast<std::uint8_t>(frame.type);
-    hdr->flags = 0;
-    hdr->tx_id = frame.tx_id;
-    hdr->key_len = static_cast<std::uint32_t>(frame.key.size());
-    hdr->val_len = static_cast<std::uint64_t>(frame.value.size());
-
-    std::uint8_t* payload = buffer.data() + sizeof(RawFrameHeader);
-    if (!frame.key.empty()) {
-        std::memcpy(payload, frame.key.data(), frame.key.size());
-    }
-    if (!frame.value.empty()) {
-        std::memcpy(payload + frame.key.size(), frame.value.data(), frame.value.size());
-    }
-
-    std::uint32_t checksum = calculate_crc32(buffer.data(), sizeof(RawFrameHeader) + frame.key.size() + frame.value.size());
-    std::memcpy(buffer.data() + total_size - sizeof(std::uint32_t), &checksum, sizeof(std::uint32_t));
-
+    std::vector<std::uint8_t> buffer;
+    serialize_frame_to(frame, buffer);
     return buffer;
+}
+
+Status deserialize_frame_header(const std::uint8_t* buffer, std::size_t size, FrameHeader& out_header) {
+    if (size < FRAME_HEADER_SIZE) {
+        return Status::Corruption;
+    }
+
+    std::uint32_t magic = decode_le32(buffer + 0);
+    std::uint16_t version = decode_le16(buffer + 4);
+    std::uint8_t type_val = buffer[6];
+    std::uint8_t flags = buffer[7];
+    std::uint64_t tx_id = decode_le64(buffer + 8);
+    std::uint32_t key_len = decode_le32(buffer + 16);
+    std::uint64_t val_len = decode_le64(buffer + 20);
+
+    if (magic != FRAME_MAGIC || version != FRAME_FORMAT_VERSION) {
+        return Status::Corruption;
+    }
+
+    if (type_val < static_cast<std::uint8_t>(RecordType::Begin) ||
+        type_val > static_cast<std::uint8_t>(RecordType::Commit)) {
+        return Status::Corruption;
+    }
+
+    if (key_len > MAX_KEY_SIZE || val_len > MAX_VALUE_SIZE) {
+        return Status::Corruption;
+    }
+
+    out_header.type = static_cast<RecordType>(type_val);
+    out_header.flags = flags;
+    out_header.tx_id = tx_id;
+    out_header.key_len = key_len;
+    out_header.val_len = val_len;
+
+    return Status::Ok;
 }
 
 Status deserialize_frame(const std::uint8_t* buffer, std::size_t size, Frame& out_frame, std::size_t& bytes_consumed) {
     bytes_consumed = 0;
-    if (size < sizeof(RawFrameHeader) + sizeof(std::uint32_t)) {
-        return Status::Corruption; // Too short for header + checksum
-    }
-    const RawFrameHeader* hdr = reinterpret_cast<const RawFrameHeader*>(buffer);
-    if (hdr->frame_magic != FRAME_MAGIC || hdr->format_version != FRAME_FORMAT_VERSION) {
-        return Status::Corruption;
-    }
-    if (hdr->key_len > MAX_KEY_SIZE || hdr->val_len > MAX_VALUE_SIZE) {
-        return Status::Corruption;
+    FrameHeader hdr;
+    Status s = deserialize_frame_header(buffer, size, hdr);
+    if (!is_ok(s)) {
+        return s;
     }
 
-    std::size_t expected_total = sizeof(RawFrameHeader) + hdr->key_len + hdr->val_len + sizeof(std::uint32_t);
-    if (size < expected_total) {
-        return Status::Corruption; // Incomplete frame
+    std::size_t total_required = hdr.total_frame_size();
+    if (size < total_required) {
+        return Status::Corruption; // Incomplete / truncated frame
     }
 
-    // Verify CRC32
-    std::uint32_t expected_crc;
-    std::memcpy(&expected_crc, buffer + expected_total - sizeof(std::uint32_t), sizeof(std::uint32_t));
-    std::uint32_t computed_crc = calculate_crc32(buffer, expected_total - sizeof(std::uint32_t));
+    // Verify CRC32 checksum
+    std::size_t data_len_for_crc = FRAME_HEADER_SIZE + hdr.payload_size();
+    std::uint32_t expected_crc = decode_le32(buffer + data_len_for_crc);
+    std::uint32_t computed_crc = calculate_crc32(buffer, data_len_for_crc);
+
     if (expected_crc != computed_crc) {
         return Status::Corruption;
     }
 
-    out_frame.type = static_cast<RecordType>(hdr->record_type);
-    out_frame.tx_id = hdr->tx_id;
-    const char* payload = reinterpret_cast<const char*>(buffer + sizeof(RawFrameHeader));
-    out_frame.key.assign(payload, hdr->key_len);
-    out_frame.value.assign(payload + hdr->key_len, hdr->val_len);
+    out_frame.type = hdr.type;
+    out_frame.tx_id = hdr.tx_id;
 
-    bytes_consumed = expected_total;
+    const char* payload = reinterpret_cast<const char*>(buffer + FRAME_HEADER_SIZE);
+    if (hdr.key_len > 0) {
+        out_frame.key.assign(payload, hdr.key_len);
+    } else {
+        out_frame.key.clear();
+    }
+
+    if (hdr.val_len > 0) {
+        out_frame.value.assign(payload + hdr.key_len, static_cast<std::size_t>(hdr.val_len));
+    } else {
+        out_frame.value.clear();
+    }
+
+    bytes_consumed = total_required;
     return Status::Ok;
 }
 

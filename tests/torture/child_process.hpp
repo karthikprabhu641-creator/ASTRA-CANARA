@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <string>
 #include <utility>
 #include <vector>
@@ -9,6 +10,8 @@ namespace torture {
 
 class ChildProcess {
 public:
+    static constexpr std::size_t max_output_line_bytes = 64U * 1024U * 1024U;
+
     ChildProcess();
     ~ChildProcess();
 

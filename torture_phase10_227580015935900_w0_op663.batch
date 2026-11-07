@@ -1,0 +1,5 @@
+PUT worker_0_key_62 worker_0_value_5285840259826126239
+PUT worker_0_key_50 worker_0_value_340706250923149914
+PUT worker_0_key_7 worker_0_value_6147950552177707705
+DEL worker_0_key_54
+DEL worker_0_key_51
